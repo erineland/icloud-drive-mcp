@@ -1,2 +1,6 @@
 taxonomy.json
+tags.json
+protected.json
 __pycache__/
+*.jsonl
+BRIEF.md

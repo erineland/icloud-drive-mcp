@@ -15,10 +15,22 @@ Tools
   icloud_read    text extraction from PDF / docx / rtf / pages / plain text
   icloud_write   writes a document, proposing a destination from the folder
                  taxonomy; refuses to write until confirm=true
+  icloud_tag     adds/removes Finder tags from a controlled vocabulary;
+                 dry run until confirm=true, audit-logged, undoable
+  icloud_tags    the tag vocabulary with counts, or the files carrying a tag
+
+Personal configuration lives next to this file and is git-ignored:
+  taxonomy.json   filing rules for icloud_write   (see taxonomy.example.json)
+  tags.json       the tag vocabulary              (see tags.example.json)
+  protected.json  extra never-touch path patterns (see protected.example.json)
 """
 
+import ctypes
+import ctypes.util
 import json
 import os
+import plistlib
+import secrets
 import re
 import subprocess
 import sys
@@ -30,9 +42,16 @@ ICLOUD_ROOT = os.path.expanduser(
 )
 HERE = os.path.dirname(os.path.abspath(__file__))
 PDFTEXT_JS = os.path.join(HERE, "pdftext.js")
+# Where the personal config files live (default: next to this file).
+CONFIG_DIR = os.environ.get("ICLOUD_MCP_CONFIG_DIR", HERE)
+# Where the tag audit log lives. Outside the server folder on purpose, so a
+# routine tag change doesn't look like the server itself was modified.
+STATE_DIR = os.environ.get(
+    "ICLOUD_MCP_STATE_DIR", os.path.expanduser("~/.local/state/icloud-mcp")
+)
 
 SERVER_NAME = "icloud"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 DEFAULT_PROTOCOL = "2025-06-18"
 SUPPORTED_PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 
@@ -69,9 +88,9 @@ PLAIN_TEXT_EXT = {
     ".log", ".html", ".htm", ".xml", ".py", ".js", ".ts", ".sh", ".css",
 }
 
-# Destination taxonomy: (keywords, folder) rules, first match wins.
-# Your own rules live in taxonomy.json next to this file (git-ignored, because a
-# folder taxonomy says a lot about a life). taxonomy.example.json shows the format.
+# Destination taxonomy: (keywords, folder) rules, first match wins, so more
+# specific rules sit higher. Your own rules live in taxonomy.json (git-ignored,
+# because a filing taxonomy says a lot about a life). This is only the fallback.
 DEFAULT_TAXONOMY = [
     (("passport", "birth certificate", "identification"), "Documents/Important Documents"),
     (("insurance", "policy schedule"), "Documents/Insurance"),
@@ -88,12 +107,19 @@ DEFAULT_TAXONOMY = [
 ]
 
 
-def load_taxonomy():
-    path = os.path.join(HERE, "taxonomy.json")
+def load_json_config(name):
+    path = os.path.join(CONFIG_DIR, name)
     if not os.path.exists(path):
-        return DEFAULT_TAXONOMY
+        return None
     with open(path, encoding="utf-8") as fh:
-        return [(tuple(r["keywords"]), r["folder"]) for r in json.load(fh)]
+        return json.load(fh)
+
+
+def load_taxonomy():
+    rules = load_json_config("taxonomy.json")
+    if rules is None:
+        return DEFAULT_TAXONOMY
+    return [(tuple(r["keywords"]), r["folder"]) for r in rules]
 
 
 TAXONOMY = load_taxonomy()
@@ -110,6 +136,43 @@ def log(msg):
 
 def is_noise(path):
     return any(n in path for n in NOISE)
+
+
+# Files the server must never open, list, overwrite or tag: account-recovery
+# material, wallet backups, credit reports and ID scans. The owner opens these
+# themselves. Checked on the real path (symlinks resolved), case-insensitively.
+# protected.json can add patterns and replace the refusal message.
+DEFAULT_PROTECTED = (
+    r"recovery[ _-]?code", r"recovery[ _-]?key", r"emergency[ _-]?kit", r"secret[ _-]?qr",
+    r"security[ _-]?qr", r"(^|/)credit reports(/|$)", r"bitlocker",
+    r"passport", r"driving[ _-]?licen[cs]e", r"drivers?[ _-]?licen[cs]e",
+)
+DEFAULT_PROTECTED_MSG = "protected file: open it yourself (it matches a protected pattern)."
+
+
+def load_protected():
+    cfg = load_json_config("protected.json") or {}
+    patterns = list(DEFAULT_PROTECTED)
+    for pat in cfg.get("patterns", []):
+        if pat not in patterns:
+            patterns.append(pat)
+    return [re.compile(p, re.I) for p in patterns], cfg.get("message", DEFAULT_PROTECTED_MSG)
+
+
+PROTECTED, PROTECTED_MSG = load_protected()
+
+
+def is_protected(path):
+    try:
+        r = rel(os.path.realpath(path))
+    except Exception:
+        return True
+    return any(p.search(r) for p in PROTECTED)
+
+
+def masked_name(path):
+    """A protected file's path for listings: long digit runs (e.g. PDF passwords) hidden."""
+    return re.sub(r"\d{5,}", lambda m: "#" * len(m.group(0)), rel(path))
 
 
 def resolve(path):
@@ -252,8 +315,12 @@ def snippet_for(path, terms, width=110):
 
 def tool_search(args):
     query = (args.get("query") or "").strip()
-    if not query:
-        return "Provide a query."
+    tags = [t.strip() for t in as_list(args.get("tags")) if t and t.strip()]
+    tag_mode = (args.get("tag_mode") or "all").lower()
+    if not query and not tags:
+        return "Provide a query, tags, or both."
+    if tag_mode not in ("all", "any"):
+        return "tag_mode must be 'all' or 'any'."
 
     limit = int(args.get("limit") or 20)
     kind = (args.get("kind") or "any").lower()
@@ -265,15 +332,32 @@ def tool_search(args):
     if not os.path.isdir(scope):
         return f"No such folder: {folder}"
 
-    cmd = ["mdfind", "-onlyin", scope]
-    if names_only:
-        cmd += ["-name", query]
-    else:
-        cmd += [query]
+    tagged = None
+    if tags:
+        try:
+            vocab = load_vocab()
+        except ValueError:
+            vocab = {}
+        tags = [canonical_tag(t, vocab) for t in tags]
+        try:
+            tagged = spotlight_tag_paths(tags, tag_mode, scope)
+        except RuntimeError as e:
+            return str(e)
 
-    code, out, err = run_cmd(cmd, timeout=90)
-    if code != 0:
-        return f"Spotlight search failed: {err.strip() or code}"
+    if query:
+        cmd = ["mdfind", "-onlyin", scope]
+        if names_only:
+            cmd += ["-name", query]
+        else:
+            cmd += [query]
+        code, out, err = run_cmd(cmd, timeout=90)
+        if code != 0:
+            return f"Spotlight search failed: {err.strip() or code}"
+        if tagged is not None:
+            keep = set(tagged)
+            out = "\n".join(l for l in out.splitlines() if l in keep)
+    else:
+        out = "\n".join(tagged)
 
     since_ts = None
     if since:
@@ -309,19 +393,29 @@ def tool_search(args):
     total = len(rows)
     rows = rows[:limit]
 
+    what = repr(query) if query else ""
+    if tags:
+        joined = (" + " if tag_mode == "all" else " or ").join(tags)
+        what = (what + " " if what else "") + f"tagged {joined}"
+
     if not rows:
         extra = f" ({skipped_noise} noise paths filtered)" if skipped_noise else ""
-        return f"No matches for {query!r}{extra}."
+        return f"No matches for {what}{extra}."
 
     terms = [t for t in re.split(r"\s+", query) if len(t) > 2]
-    lines = [f"{total} match(es) for {query!r}; showing {len(rows)}, newest first."]
+    lines = [f"{total} match(es) for {what}; showing {len(rows)}, newest first."]
     if skipped_noise:
         lines.append(f"({skipped_noise} node_modules/build paths filtered out)")
     lines.append("")
     for mtime, size, path in rows:
         when = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
+        if is_protected(path):
+            lines.append(f"{masked_name(path)}")
+            lines.append(f"    {when} · {human_size(size)} · protected (open it yourself)")
+            continue
         lines.append(f"{rel(path)}")
-        lines.append(f"    {when} · {human_size(size)}")
+        names = tag_names(path)
+        lines.append(f"    {when} · {human_size(size)}" + (f" · tags: {', '.join(names)}" if names else ""))
         snip = snippet_for(path, terms)
         if snip:
             lines.append(f"    {snip}")
@@ -335,9 +429,12 @@ def tool_read(args):
     path = resolve(path_arg)
     if not os.path.exists(path):
         return f"No such file: {path_arg}"
+    if is_protected(path):
+        return PROTECTED_MSG
     if os.path.isdir(path) and not path.endswith((".pages", ".key", ".numbers")):
         entries = sorted(os.listdir(path))[:100]
-        return f"{rel(path)} is a directory:\n" + "\n".join("  " + e for e in entries)
+        shown = [e + "  (protected)" if is_protected(os.path.join(path, e)) else e for e in entries]
+        return f"{rel(path)} is a directory:\n" + "\n".join("  " + e for e in shown)
 
     pages = None
     if args.get("pages"):
@@ -404,6 +501,8 @@ def tool_write(args):
     except ValueError as e:
         return str(e)
     dest = os.path.join(dest_dir, filename)
+    if is_protected(dest) or is_protected(dest_dir):
+        return PROTECTED_MSG
 
     exists = os.path.exists(dest)
     dir_exists = os.path.isdir(dest_dir)
@@ -439,6 +538,415 @@ def tool_write(args):
     return f"{verb} {rel(dest)} ({human_size(os.path.getsize(dest))})"
 
 
+# ---------------------------------------------------------------- tags
+#
+# Finder tags live in the extended attribute com.apple.metadata:_kMDItemUserTags
+# as a binary plist: a list of "name\ncolour" strings (colour 0-7). iCloud Drive
+# syncs the attribute, Finder and the Files app show it, Spotlight indexes it as
+# kMDItemUserTags.
+#
+# Why raw xattr rather than NSURL's NSURLTagNamesKey: setting tags through that
+# API writes every tag back with colour 0, silently stripping the colours of tags
+# that were already on the file (verified on macOS 27, Nov 2026). Writing the
+# attribute ourselves keeps existing entries byte-for-byte. ctypes is stdlib, so
+# this stays dependency-free.
+#
+# Colours: inside iCloud Drive the sync daemon rewrites every entry's colour
+# digit to 1 within seconds (verified Nov 2026), so per-file colours don't
+# survive there. The colour a device shows comes from its tag list (Finder >
+# Settings > Tags, or the Files app), which syncs by tag NAME. tags.json's
+# colours are still written (they hold outside iCloud) and are the reference
+# for setting each tag's colour once in that list.
+
+TAG_XATTR = b"com.apple.metadata:_kMDItemUserTags"
+XATTR_NOFOLLOW = 0x0001
+ENOATTR = 93
+MAX_TAG_FILES = 50
+PACKAGE_EXTS = (".pages", ".key", ".numbers", ".rtfd")
+
+COLOURS = {"none": 0, "grey": 1, "gray": 1, "green": 2, "purple": 3,
+           "blue": 4, "yellow": 5, "red": 6, "orange": 7}
+COLOUR_NAMES = {0: "none", 1: "grey", 2: "green", 3: "purple",
+                4: "blue", 5: "yellow", 6: "red", 7: "orange"}
+# A tag name may not hold control characters, quotes, backslashes or wildcards:
+# they'd break the plist entry format or the Spotlight query.
+TAG_NAME_RE = re.compile(r'^[^\x00-\x1f"\\*]{1,40}$')
+
+_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+_libc.getxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p,
+                           ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+_libc.getxattr.restype = ctypes.c_ssize_t
+_libc.setxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p,
+                           ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+_libc.setxattr.restype = ctypes.c_int
+_libc.removexattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+_libc.removexattr.restype = ctypes.c_int
+
+
+def read_tag_entries(path):
+    """The raw tag entries on a file, e.g. ['Work\\n4', 'tax-2025-26\\n0']."""
+    p = os.fsencode(path)
+    size = _libc.getxattr(p, TAG_XATTR, None, 0, 0, XATTR_NOFOLLOW)
+    if size < 0:
+        err = ctypes.get_errno()
+        if err == ENOATTR:
+            return []
+        raise OSError(err, os.strerror(err), path)
+    buf = ctypes.create_string_buffer(size)
+    got = _libc.getxattr(p, TAG_XATTR, buf, size, 0, XATTR_NOFOLLOW)
+    if got < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), path)
+    data = plistlib.loads(buf.raw[:got])
+    if not isinstance(data, list) or not all(isinstance(e, str) for e in data):
+        raise ValueError(f"unexpected tag data on {rel(path)}")
+    return data
+
+
+def write_tag_entries(path, entries):
+    """Replace a file's tag entries. An empty list removes the attribute, as Finder does."""
+    p = os.fsencode(path)
+    if not entries:
+        if _libc.removexattr(p, TAG_XATTR, XATTR_NOFOLLOW) != 0:
+            err = ctypes.get_errno()
+            if err != ENOATTR:
+                raise OSError(err, os.strerror(err), path)
+        return
+    data = plistlib.dumps(list(entries), fmt=plistlib.FMT_BINARY)
+    if _libc.setxattr(p, TAG_XATTR, data, len(data), 0, XATTR_NOFOLLOW) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), path)
+
+
+def entry_name(entry):
+    return entry.split("\n", 1)[0]
+
+
+def names_of(entries):
+    return [entry_name(e) for e in entries]
+
+
+def tag_names(path):
+    try:
+        return [entry_name(e) for e in read_tag_entries(path)]
+    except Exception:
+        return []
+
+
+def load_vocab():
+    """tags.json → {lowercased name: {name, colour, facet, description}}.
+
+    Re-read on every call so an edit to tags.json applies without a restart.
+    """
+    cfg = load_json_config("tags.json")
+    if cfg is None:
+        return {}
+    vocab = {}
+    for t in cfg.get("tags", []):
+        name = t.get("name", "")
+        if not TAG_NAME_RE.match(name) or name != name.strip():
+            raise ValueError(f"tags.json: bad tag name {name!r}")
+        colour = t.get("colour", "none")
+        if colour not in COLOURS:
+            raise ValueError(f"tags.json: tag {name!r} has unknown colour {colour!r}")
+        entry = {
+            "name": name,
+            "colour": COLOURS[colour],
+            "facet": t.get("facet", ""),
+            "description": t.get("description", ""),
+        }
+        if name.lower() in vocab:
+            raise ValueError(f"tags.json: tag {name!r} is listed twice")
+        vocab[name.lower()] = entry
+    # Aliases: a tag can be named without its leading emoji ("proof of address"
+    # for "🏠 Proof of address"), so nobody has to type emoji. Never shadows a real name.
+    for entry in list(vocab.values()):
+        bare = tag_alias(entry["name"])
+        if bare and bare not in vocab:
+            vocab[bare] = entry
+    return vocab
+
+
+def tag_alias(name):
+    """A tag name without leading emoji/symbols, lowercased ('' if nothing differs)."""
+    bare = re.sub(r"^[^\w]+", "", name).strip().lower()
+    return bare if bare and bare != name.lower() else ""
+
+
+def vocab_tags(vocab):
+    """Each vocabulary tag once (the dict also holds aliases)."""
+    seen, out = set(), []
+    for v in vocab.values():
+        if v["name"] not in seen:
+            seen.add(v["name"])
+            out.append(v)
+    return out
+
+
+def canonical_tag(name, vocab):
+    v = vocab.get(name.strip().lower())
+    return v["name"] if v else name.strip()
+
+
+def as_list(v):
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v]
+    return list(v)
+
+
+def spotlight_quote(s):
+    return s.replace("\\", "\\\\").replace('"', '\\"').replace("*", "\\*")
+
+
+def spotlight_tag_paths(names, mode="all", scope=None):
+    """Paths carrying the tags (mode 'all' = every tag, 'any' = at least one)."""
+    joiner = " && " if mode == "all" else " || "
+    query = joiner.join(f'(kMDItemUserTags == "{spotlight_quote(n)}"c)' for n in names)
+    code, out, err = run_cmd(["mdfind", "-onlyin", scope or ICLOUD_ROOT, query], timeout=90)
+    if code != 0:
+        raise RuntimeError(f"Spotlight tag search failed: {err.strip() or code}")
+    return [line for line in out.splitlines() if line and not is_noise(line)]
+
+
+def audit_path():
+    return os.path.join(STATE_DIR, "tag-audit.jsonl")
+
+
+def new_batch_id():
+    return datetime.now().strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(2)
+
+
+def audit_append(record):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(audit_path(), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def audit_records(batch):
+    try:
+        with open(audit_path(), encoding="utf-8") as fh:
+            rows = [json.loads(line) for line in fh if line.strip()]
+    except FileNotFoundError:
+        return []
+    return [r for r in rows if r.get("batch") == batch]
+
+
+def describe(entries):
+    return ", ".join(entry_name(e) for e in entries) or "(none)"
+
+
+def apply_changes(changes, op, undoes=None):
+    """changes: [(abs_path, before, after)]. Applies, verifies and logs each one.
+
+    A change whose audit line can't be written is rolled back, so the log never
+    misses an applied change.
+    """
+    batch = new_batch_id()
+    done, failed = [], []
+    for path, before, after in changes:
+        try:
+            write_tag_entries(path, after)
+            if read_tag_entries(path) != after:
+                raise RuntimeError("tags read back differently after writing")
+            record = {
+                "batch": batch, "ts": datetime.now().isoformat(timespec="seconds"),
+                "op": op, "path": rel(path), "before": before, "after": after,
+            }
+            if undoes:
+                record["undoes"] = undoes
+            try:
+                audit_append(record)
+            except Exception:
+                write_tag_entries(path, before)
+                raise
+            done.append((path, before, after))
+        except Exception as e:
+            failed.append((path, str(e)))
+    return batch, done, failed
+
+
+def tag_target_problem(path):
+    """Why a resolved path can't be tagged, or None if it can."""
+    if is_noise(path):
+        return "inside node_modules/build noise; never tagged"
+    if not os.path.exists(path):
+        return "no such file"
+    if os.path.realpath(path) == os.path.realpath(ICLOUD_ROOT):
+        return "that's the iCloud Drive root"
+    if is_protected(path):
+        return "protected file: tag it yourself in Finder"
+    if os.path.isdir(path) and not path.lower().endswith(PACKAGE_EXTS):
+        return "folders aren't tagged (the folder already says it); tag the files"
+    return None
+
+
+def tool_tag(args):
+    if args.get("undo"):
+        return undo_batch(str(args["undo"]), bool(args.get("confirm")))
+
+    files = as_list(args.get("files"))
+    add, remove = as_list(args.get("add")), as_list(args.get("remove"))
+    confirm = bool(args.get("confirm"))
+    if not files:
+        return "Provide 'files' (one path or a list)."
+    if not add and not remove:
+        return "Provide tags to 'add' and/or 'remove'."
+    if len(files) > MAX_TAG_FILES:
+        return f"Refused: {len(files)} files is over the per-call cap of {MAX_TAG_FILES}. Split it into batches."
+
+    vocab = load_vocab()
+    unknown = [t for t in add + remove if t.lower() not in vocab]
+    if unknown:
+        hint = "No tags.json yet, so no tags are allowed." if not vocab else \
+            "Allowed: " + ", ".join(v["name"] for v in vocab_tags(vocab))
+        return ("Refused: not in the tag vocabulary: " + ", ".join(unknown) +
+                ".\nNew tags are added by editing tags.json, not by this tool.\n" + hint)
+    add_v = [vocab[t.lower()] for t in add]
+    remove_keys = {vocab[t.lower()]["name"].lower() for t in remove}
+    clash = {v["name"].lower() for v in add_v} & remove_keys
+    if clash:
+        return "Refused: the same tag is in both add and remove: " + ", ".join(sorted(clash))
+
+    resolved, seen = [], set()
+    for f in files:
+        try:
+            full = resolve(f)
+        except ValueError as e:
+            return f"Refused: {e}"
+        if is_noise(full):
+            return f"Refused: {f} is inside node_modules/build noise; never tagged."
+        if full not in seen:
+            seen.add(full)
+            resolved.append((f, full))
+
+    changes, lines, skipped = [], [], []
+    for given, full in resolved:
+        problem = tag_target_problem(full)
+        if problem:
+            skipped.append(f"  ✗ {given}: {problem}")
+            continue
+        try:
+            before = read_tag_entries(full)
+        except Exception as e:
+            skipped.append(f"  ✗ {given}: can't read its tags ({e})")
+            continue
+        after = [e for e in before if entry_name(e).lower() not in remove_keys]
+        have = {entry_name(e).lower() for e in after}
+        for v in add_v:
+            if v["name"].lower() not in have:
+                after.append(f"{v['name']}\n{v['colour']}")
+                have.add(v["name"].lower())
+        if after == before:
+            lines.append(f"  = {rel(full)}\n      no change ({describe(before)})")
+            continue
+        changes.append((full, before, after))
+        lines.append(f"  ~ {rel(full)}\n      {describe(before)}  →  {describe(after)}")
+
+    if not confirm:
+        out = [f"PROPOSED (nothing changed yet; call again with confirm=true): "
+               f"{len(changes)} file(s) would change."]
+        return "\n".join(out + [""] + lines + skipped)
+
+    if not changes:
+        return "Nothing to change.\n" + "\n".join(lines + skipped)
+    batch, done, failed = apply_changes(changes, "tag")
+    out = [f"Tagged {len(done)} file(s). Batch {batch}."]
+    if done:
+        out.append(f"Undo: icloud_tag with undo=\"{batch}\" "
+                   f"(or: /usr/bin/python3 icloud_mcp.py --undo {batch} --confirm)")
+    out.append("")
+    out += lines + skipped
+    out += [f"  ✗ {rel(p)}: FAILED, left as it was ({e})" for p, e in failed]
+    return "\n".join(out)
+
+
+def undo_batch(batch, confirm):
+    records = [r for r in audit_records(batch)]
+    if not records:
+        return f"No batch {batch!r} in the audit log ({audit_path()})."
+    changes, lines = [], []
+    for r in records:
+        try:
+            full = resolve(r["path"])
+        except ValueError as e:
+            lines.append(f"  ✗ {r['path']}: {e}")
+            continue
+        if not os.path.exists(full):
+            lines.append(f"  ✗ {r['path']}: no longer there (moved or renamed?); skipped")
+            continue
+        current = read_tag_entries(full)
+        # Compare names, not colours: iCloud Drive resets every entry's colour
+        # digit to 1 seconds after syncing, so "after" never matches byte-for-byte.
+        if names_of(current) == names_of(r["before"]):
+            lines.append(f"  = {r['path']}: already back to {describe(r['before'])}")
+        elif names_of(current) != names_of(r["after"]):
+            lines.append(f"  ✗ {r['path']}: tags changed since that batch "
+                         f"(now {describe(current)}); skipped, nothing overwritten")
+        else:
+            changes.append((full, current, r["before"]))
+            lines.append(f"  ~ {r['path']}\n      {describe(current)}  →  {describe(r['before'])}")
+    if not confirm:
+        return "\n".join([f"PROPOSED UNDO of {batch} (nothing changed yet; call again with "
+                          f"confirm=true): {len(changes)} file(s) would be restored.", ""] + lines)
+    if not changes:
+        return "Nothing to undo.\n" + "\n".join(lines)
+    new, done, failed = apply_changes(changes, "undo", undoes=batch)
+    out = [f"Restored {len(done)} file(s). Undo batch {new} (itself undoable)."]
+    out += [""] + lines
+    out += [f"  ✗ {rel(p)}: FAILED, left as it was ({e})" for p, e in failed]
+    return "\n".join(out)
+
+
+def tool_tags(args):
+    tag = (args.get("tag") or "").strip()
+    vocab = load_vocab()
+    if tag:
+        tag = canonical_tag(tag, vocab)
+        limit = int(args.get("limit") or 50)
+        rows = []
+        for p in spotlight_tag_paths([tag]):
+            try:
+                rows.append((os.stat(p).st_mtime, p))
+            except OSError:
+                continue
+        rows.sort(reverse=True)
+        note = "" if tag.lower() in vocab else "  (not in the vocabulary)"
+        out = [f"{len(rows)} file(s) tagged {tag!r}{note}; showing {min(limit, len(rows))}, newest first.", ""]
+        for mtime, p in rows[:limit]:
+            when = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
+            name = masked_name(p) + "  (protected)" if is_protected(p) else rel(p)
+            out.append(f"{name}\n    {when} · tags: {', '.join(tag_names(p)) or '(none)'}")
+        return "\n".join(out)
+
+    if not vocab:
+        return "No tag vocabulary yet: create tags.json next to the server (see tags.example.json)."
+    out = ["Tag vocabulary (files tagged in iCloud Drive):", ""]
+    by_facet = {}
+    for v in vocab_tags(vocab):
+        by_facet.setdefault(v["facet"] or "Other", []).append(v)
+    for facet, tags in by_facet.items():
+        out.append(f"{facet}")
+        for v in tags:
+            n = len(spotlight_tag_paths([v["name"]]))
+            out.append(f"  {v['name']}  [{COLOUR_NAMES[v['colour']]}]  {n} file(s)"
+                       + (f"  · {v['description']}" if v["description"] else ""))
+        out.append("")
+    others = {}
+    code, raw, _ = run_cmd(["mdfind", "-onlyin", ICLOUD_ROOT, 'kMDItemUserTags == "*"'], timeout=90)
+    for p in [l for l in raw.splitlines() if l and not is_noise(l)][:5000]:
+        for name in tag_names(p):
+            if name.lower() not in vocab:
+                others[name] = others.get(name, 0) + 1
+    if others:
+        out.append("Other tags already on files (not in the vocabulary; left alone):")
+        out += [f"  {n}  {c} file(s)" for n, c in sorted(others.items(), key=lambda x: (-x[1], x[0]))]
+    return "\n".join(out)
+
+
 # ---------------------------------------------------------------- MCP wiring
 
 TOOLS = [
@@ -448,12 +956,17 @@ TOOLS = [
             "Search iCloud Drive by content or filename using macOS Spotlight. "
             "Searches inside PDFs, Pages documents, Markdown and plain text. "
             "Automatically filters out node_modules and build-artefact noise. "
-            "Results are newest-first."
+            "Optional 'tags' filter (Finder tags), alone or combined with the query. "
+            "Results are newest-first and show each file's tags."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Words to search for."},
+                "query": {"type": "string", "description": "Words to search for. Optional when 'tags' is given."},
+                "tags": {"type": "array", "items": {"type": "string"},
+                         "description": "Only files carrying these Finder tags (case-insensitive)."},
+                "tag_mode": {"type": "string", "enum": ["all", "any"],
+                             "description": "'all' (default): every tag must be present. 'any': at least one."},
                 "kind": {
                     "type": "string",
                     "enum": ["any", "pdf", "doc", "sheet", "slides", "image", "text", "markdown", "archive"],
@@ -464,7 +977,6 @@ TOOLS = [
                 "names_only": {"type": "boolean", "description": "Match filenames only, not contents. Default false."},
                 "limit": {"type": "integer", "description": "Max results. Default 20."},
             },
-            "required": ["query"],
         },
     },
     {
@@ -507,10 +1019,53 @@ TOOLS = [
     },
 ]
 
+TOOLS += [
+    {
+        "name": "icloud_tag",
+        "description": (
+            "Add or remove Finder tags on iCloud Drive files. Tags must come from "
+            "the controlled vocabulary (tags.json); unknown tags are refused. Call "
+            "WITHOUT confirm first to see the before -> after for every file, then "
+            f"again with confirm=true to apply. At most {MAX_TAG_FILES} files per call. "
+            "Only tags change: files are never moved, renamed, edited or deleted. "
+            "Every applied change is audit-logged with a batch id; pass undo=<batch id> "
+            "(dry run, then confirm=true) to restore exactly what was there before."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "files": {"type": "array", "items": {"type": "string"},
+                          "description": "Paths, absolute or relative to iCloud Drive root."},
+                "add": {"type": "array", "items": {"type": "string"}, "description": "Tags to add."},
+                "remove": {"type": "array", "items": {"type": "string"}, "description": "Tags to remove."},
+                "confirm": {"type": "boolean", "description": "Must be true to apply. Default false (dry run)."},
+                "undo": {"type": "string", "description": "A batch id to undo instead (dry run unless confirm=true)."},
+            },
+        },
+    },
+    {
+        "name": "icloud_tags",
+        "description": (
+            "Without 'tag': the tag vocabulary grouped by facet, with colour and how "
+            "many files carry each, plus any other tags already on files. With 'tag': "
+            "the files carrying it, newest first."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tag": {"type": "string", "description": "List the files carrying this tag."},
+                "limit": {"type": "integer", "description": "Max files when listing a tag. Default 50."},
+            },
+        },
+    },
+]
+
 HANDLERS = {
     "icloud_search": tool_search,
     "icloud_read": tool_read,
     "icloud_write": tool_write,
+    "icloud_tag": tool_tag,
+    "icloud_tags": tool_tags,
 }
 
 
@@ -565,6 +1120,11 @@ def handle(req):
 
 
 def main():
+    # CLI undo, so a tag batch can be reversed without Claude:
+    #   /usr/bin/python3 icloud_mcp.py --undo <batch id> [--confirm]
+    if len(sys.argv) >= 3 and sys.argv[1] == "--undo":
+        print(undo_batch(sys.argv[2], "--confirm" in sys.argv[3:]))
+        return
     if not os.path.isdir(ICLOUD_ROOT):
         log(f"FATAL: iCloud Drive not found at {ICLOUD_ROOT}")
         sys.exit(1)

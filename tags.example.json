@@ -1,0 +1,12 @@
+{
+  "_comment": "Copy to tags.json (git-ignored) and make it yours. Tags carry what folders can't: a file lives in ONE folder but can be proof of address AND in a tax year AND waiting on a reply. One colour per facet, so the dot alone tells you what kind of tag it is. Colours: none grey green purple blue yellow red orange. A tag can be referred to without its leading emoji.",
+  "tags": [
+    {"name": "🔥 Action needed", "colour": "red", "facet": "Action", "description": "Something to do: reply, pay, sign, send."},
+    {"name": "⏳ Waiting on them", "colour": "orange", "facet": "Waiting", "description": "Sent or claimed; waiting for a reply, refund or decision."},
+    {"name": "📅 Renews or expires", "colour": "yellow", "facet": "Dates", "description": "Has a renewal or expiry date worth watching."},
+    {"name": "🏠 Proof of address", "colour": "green", "facet": "Proof of", "description": "Accepted as proof of address."},
+    {"name": "💷 Proof of income", "colour": "green", "facet": "Proof of", "description": "Payslips, P60s, contracts showing salary."},
+    {"name": "📊 Tax 2025-26", "colour": "blue", "facet": "Tax year", "description": "Belongs to the 6 Apr 2025 – 5 Apr 2026 tax year."},
+    {"name": "🎯 Career evidence", "colour": "grey", "facet": "Packs", "description": "Wins, reviews and certificates for a CV or promotion case."}
+  ]
+}

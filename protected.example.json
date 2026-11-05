@@ -1,0 +1,8 @@
+{
+  "_comment": "Copy to protected.json (git-ignored). Extra case-insensitive regexes, matched against the path relative to iCloud Drive, that the server will never open, list, overwrite or tag. Added to the built-in defaults (recovery codes, ID scans, credit reports...).",
+  "patterns": [
+    "(^|/)important documents/password manager",
+    "(^|/)wallet_backup"
+  ],
+  "message": "protected file: open it yourself."
+}
